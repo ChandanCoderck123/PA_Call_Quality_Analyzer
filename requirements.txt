@@ -1,0 +1,15 @@
+# Core dependencies
+SQLAlchemy>=1.4,<3.0
+psycopg2-binary>=2.9
+
+# Load environment vars from .env
+python-dotenv>=1.0
+
+# (optional) If you later add OpenAI calls, uncomment this:
+# openai>=1.0
+
+SQLAlchemy>=1.4,<3.0
+psycopg2-binary>=2.9
+python-dotenv>=1.0
+requests>=2.28
+openai>=1.0
