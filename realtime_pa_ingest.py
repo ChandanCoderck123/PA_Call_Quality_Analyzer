@@ -1,155 +1,161 @@
 # python realtime_pa_ingest.py init_db
-# python realtime_pa_ingest.py ingest_pa --limit 1
-
-# realtime_pa_ingest.py - HTTP-only PA Call Analyzer ingest/transcribe/upsert script
-# Fully commented file — each line has an explanatory comment of what it does.
-# # Initialize database (one-time)
-# python realtime_pa_ingest.py init_db
-
-# # Test with one recording
-# python realtime_pa_ingest.py ingest_pa --limit 1
-
-# # Process all new recordings
 # python realtime_pa_ingest.py ingest_pa
+# python realtime_pa_ingest.py ingest_pa --limit 1
+# python realtime_pa_ingest.py ingest_pa --since "2025-02-01T10:00:00Z"
+# python realtime_pa_ingest.py watch --interval 60 --limit 5
 
-"""
-PA Call Analyzer - HTTP ingest/transcribe/upsert
-- Ensures public.pa_recordings table exists
-- Fetches new rows from public.outbound_inbound_calling_details using a high-water-mark
-- Rewrites DB path-only values using PA_RECORDING_HTTP_PREFIX when needed
-- Downloads audio via HTTP(S), validates response is audio, transcribes using OpenAI
-- Upserts transcripts into public.pa_recordings with status='pending' and created = source.created
-"""
+import os                                   # os: interact with environment variables and file system
+import io                                   # io: kept for completeness (in-memory buffers)
+import time                                 # time: sleep and timing utilities used in watch loop
+import argparse                             # argparse: parse command-line arguments
+import tempfile                             # tempfile: create temporary files for downloaded audio
+from typing import Optional, List          # typing: Optional and List type hints for clarity
+from datetime import datetime, timezone    # datetime: timezone-aware timestamps
+from urllib.parse import urlparse, quote   # urlparse/quote: parse URLs and safely quote path segments
+import mimetypes                           # mimetypes: useful utilities to guess mime types (not heavily used)
+import math                                # math: numeric helpers left available if needed
+import signal                               # signal: handle SIGINT/SIGTERM for graceful shutdown
+import sys                                  # sys: for exiting with status and stderr
+import traceback                            # traceback: optional detailed stack traces for debugging
 
-# ------------------------ Standard Library Imports ------------------------
-import os                                   # read environment variables and file operations
-import io                                   # in-memory buffers (kept for completeness)
-import time                                 # backoff/sleep (not heavily used)
-import argparse                             # parse CLI arguments
-import tempfile                             # create temporary files for downloaded audio
-from typing import Optional, List          # type hints for Optional and List
-from datetime import datetime, timezone    # parse and handle timestamps/timezones
-from urllib.parse import urlparse, quote   # parse URLs and safely quote path segments
-import mimetypes                           # guess mime types by extension
-import math                                # used for file size checks (optional)
+# SQLAlchemy imports for database interaction
+from sqlalchemy import create_engine, text  # create_engine/text: create DB engine and execute safe SQL
+from sqlalchemy.engine import Engine        # Engine typing alias for clarity
+from sqlalchemy.exc import SQLAlchemyError  # SQLAlchemyError: catch DB related exceptions
 
-# ------------------------ SQLAlchemy Imports ------------------------
-from sqlalchemy import create_engine, text  # create DB engine and execute safe SQL text
-from sqlalchemy.engine import Engine        # Engine type
-from sqlalchemy.exc import SQLAlchemyError  # catch SQLAlchemy errors
-
-# ------------------------ Optional .env loader ------------------------
+# Try to load optional .env file using python-dotenv
 try:
-    from dotenv import load_dotenv          # optional .env loader
-    load_dotenv()                           # load .env into environment variables if present
-    print(" Environment: .env loaded (if present)")
+    from dotenv import load_dotenv          # import load_dotenv to bring .env into environment
+    load_dotenv()                           # call load_dotenv so .env variables are available to os.environ
+    print(" Environment: .env loaded (if present)")  # print confirmation if .env loaded
 except Exception:
-    print(" Environment: python-dotenv not found, using system env vars")
+    print(" Environment: python-dotenv not found, using system env vars")  # fallback if python-dotenv isn't installed
 
-# ------------------------ HTTP download lib (requests) ------------------------
+# Try to import requests for HTTP downloads; script requires it for network access
 try:
-    import requests                         # requests for HTTP(S) downloads
+    import requests                         # requests: used for HTTP(S) downloads of recording files
 except Exception:
-    requests = None                         # set to None when requests is not available
+    requests = None                         # if import fails, set to None and raise later when needed
 
-# ------------------------ OpenAI SDK (New + Legacy) ------------------------
+# Try to import modern OpenAI SDK, otherwise fallback to legacy openai package
 try:
-    from openai import OpenAI               # attempt to use modern OpenAI SDK
-    _HAS_NEW_OPENAI = True                  # mark that new SDK is available
+    from openai import OpenAI               # attempt to import modern OpenAI client class
+    _HAS_NEW_OPENAI = True                  # flag new SDK available
     print(" OpenAI: using new SDK (OpenAI)")
 except Exception:
-    _HAS_NEW_OPENAI = False                 # fallback to legacy package
-    import openai  # type: ignore
-    print(" OpenAI: using legacy openai package")
+    _HAS_NEW_OPENAI = False                 # mark that modern SDK isn't present
+    try:
+        import openai  # type: ignore
+        print(" OpenAI: using legacy openai package (import succeeded)")
+    except Exception:
+        print(" OpenAI SDK not found; ASR will fail if attempted (install openai package)")
 
 # ========================== Configuration ==========================
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
     "postgresql+psycopg2://user:pass@host:5432/dbname"
-)                                           # fallback DB URL (override in production)
+)                                           # DATABASE_URL: read from env or use fallback
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")  # OpenAI API key required for ASR calls
-ASR_MODEL = os.getenv("ASR_MODEL", "whisper-1")   # default ASR model (can be overridden)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")  # OPENAI_API_KEY: must be set to run ASR
+ASR_MODEL = os.getenv("ASR_MODEL", "whisper-1")   # ASR_MODEL: default Whisper model for transcription
 
-# default ISO timestamp if none provided (kept from your prior setting)
-DEFAULT_SINCE_ISO = os.getenv("PA_INGEST_DEFAULT_SINCE", "2025-11-17T13:00:00.705Z")
+DEFAULT_SINCE_ISO = os.getenv("PA_INGEST_DEFAULT_SINCE", "2025-11-17T13:00:00.705Z")  # fallback since timestamp
+PA_RECORDING_HTTP_PREFIX = os.getenv("PA_RECORDING_HTTP_PREFIX", "").rstrip("/")  # optional prefix for path-only DB values
 
-# Optional HTTP prefix to prepend to DB path values (no trailing slash)
-PA_RECORDING_HTTP_PREFIX = os.getenv("PA_RECORDING_HTTP_PREFIX", "").rstrip("/")
-
-# quick guard of allowed audio file extensions
 ALLOWED_EXTS: List[str] = [
     ".mp3", ".m4a", ".wav", ".flac", ".ogg", ".oga", ".webm", ".mp4", ".aac", ".wma"
-]
+]                                           # list of allowed file extensions used as quick guard
 
-# Acceptable audio-ish content type substrings we will allow to pass to ASR
 ALLOWED_CONTENT_TYPE_SUBSTRINGS = [
-    "audio/", "mpeg", "wav", "ogg", "webm", "mpeg", "mpeg3", "mpeg4", "mp3", "x-wav", "x-m4a", "octet-stream"
-]
+    "audio/", "mpeg", "wav", "ogg", "webm", "mpeg3", "mpeg4", "mp3", "x-wav", "x-m4a", "octet-stream"
+]                                           # substrings to validate Content-Type header
 
-# Minimum file size in bytes below which we consider the download invalid for ASR
-MIN_AUDIO_BYTES = 2 * 1024                    # 2 KB minimal sanity check (raise if needed)
+MIN_AUDIO_BYTES = 2 * 1024                    # MIN_AUDIO_BYTES: small threshold (2 KB) to avoid trivial downloads
+DEFAULT_POLL_INTERVAL = 30                     # default polling interval in seconds when using watch
+
+# Module-level flag to request graceful shutdown from signal handler
+_SHUTDOWN_REQUESTED = False
+
+def _signal_handler(signum, frame):
+    """Signal handler to set shutdown flag when SIGINT or SIGTERM is received."""
+    global _SHUTDOWN_REQUESTED                     # reference module-level shutdown flag
+    print(f"\n Signal received ({signum}), requesting graceful shutdown...")  # log signal receipt
+    _SHUTDOWN_REQUESTED = True                     # set flag so watch loop can exit cleanly
+
+# Register signal handlers for graceful termination
+signal.signal(signal.SIGINT, _signal_handler)     # handle Ctrl+C (SIGINT)
+signal.signal(signal.SIGTERM, _signal_handler)    # handle termination (SIGTERM)
 
 # ========================== DB Utilities ==========================
 def get_engine() -> Engine:
-    """Create and return a SQLAlchemy engine (reused across the run)."""
-    return create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=5, max_overflow=5)
+    """Create and return a SQLAlchemy engine using DATABASE_URL."""
+    return create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=5, max_overflow=5)  # engine with pre-ping to avoid stale connections
+
 
 def run_sql(engine: Engine, sql: str, params: Optional[dict] = None) -> None:
-    """Execute a non-SELECT SQL statement safely with parameter binding."""
-    with engine.begin() as conn:                # start transaction
-        conn.execute(text(sql), params or {})   # execute statement
+    """Execute a non-SELECT SQL statement using a transaction context."""
+    with engine.begin() as conn:                    # open a transaction-scoped connection
+        conn.execute(text(sql), params or {})       # execute provided SQL with bound parameters
+
 
 def fetch_all(engine: Engine, sql: str, params: Optional[dict] = None) -> List[dict]:
-    """Execute a SELECT query and return rows as list of dicts."""
-    with engine.begin() as conn:                # start transaction
-        result = conn.execute(text(sql), params or {})  # execute query
-        return [dict(r._mapping) for r in result.fetchall()]  # convert to list of dicts
+    """Execute a SELECT query and return rows as list of dicts for easy consumption."""
+    with engine.begin() as conn:                    # open a transaction-scoped connection
+        result = conn.execute(text(sql), params or {})  # execute select query
+        return [dict(r._mapping) for r in result.fetchall()]  # convert SQLAlchemy Row -> dict
 
 # -------------------------- Schema: pa_recordings --------------------------
 DDL_PA_RECORDINGS = """
 CREATE TABLE IF NOT EXISTS public.pa_recordings (
     id BIGSERIAL PRIMARY KEY,
     pa_recording_url TEXT UNIQUE NOT NULL,
-    created TIMESTAMPTZ NOT NULL,              -- stores same timestamp as source table's created column
+    created TIMESTAMPTZ NOT NULL,
     pa_en_transcribe TEXT,
     call_type TEXT,
     status TEXT DEFAULT 'pending',
-    created_at TIMESTAMPTZ DEFAULT now()       -- auto-generated timestamp when record was inserted
+    created_at TIMESTAMPTZ DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_pa_recordings_created ON public.pa_recordings (created);
-"""
+"""                                         # SQL DDL to ensure table exists and index for created
+
 
 def init_db(engine: Optional[Engine] = None):
-    """Ensure public.pa_recordings table exists (idempotent)."""
-    engine_to_use = engine if engine is not None else get_engine()  # reuse engine when passed
+    """Ensure the pa_recordings table and index exist (idempotent operation)."""
+    engine_to_use = engine if engine is not None else get_engine()  # allow passing engine for reuse
     try:
-        run_sql(engine_to_use, DDL_PA_RECORDINGS)   # create table and index if missing
+        run_sql(engine_to_use, DDL_PA_RECORDINGS)   # run the DDL to create table/index if missing
         print(" pa_recordings table ensured/created successfully.")
     except SQLAlchemyError as e:
-        print(f" Database initialization failed: {e}")
+        print(f" Database initialization failed: {e}")  # log DB initialization error
         raise
 
 # ====================== OpenAI helper ======================
 def _get_openai_client():
-    """Return OpenAI client instance for modern SDK, or configure legacy module-level key."""
+    """Return an OpenAI client (modern SDK) or configure legacy module-level API key.
+
+    Raises RuntimeError when OPENAI_API_KEY is not set.
+    """
     if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY environment variable is not set.")
+        raise RuntimeError("OPENAI_API_KEY environment variable is not set.")  # require API key for ASR
     if _HAS_NEW_OPENAI:
-        return OpenAI(api_key=OPENAI_API_KEY)      # return instantiated client
+        return OpenAI(api_key=OPENAI_API_KEY)      # instantiate and return modern OpenAI client
     else:
-        openai.api_key = OPENAI_API_KEY            # configure legacy package
-        return None
+        import openai  # type: ignore
+        openai.api_key = OPENAI_API_KEY            # configure legacy package's api key
+        return None                                # legacy usage uses module-level functions
+
 
 def transcribe_audio_file(local_file_path: str, prefer_translate: bool = True) -> str:
+    """Transcribe or translate a local audio file using OpenAI audio endpoints.
+
+    - prefer_translate=True uses translations endpoint (better for non-English)
+    - Supports new and legacy SDK shapes
+    - Returns a string containing the transcription
     """
-    Transcribe or translate a local audio file to English using OpenAI audio endpoints.
-    prefer_translate=True uses translations endpoint (better for non-English audio).
-    """
-    client = _get_openai_client()                  # obtain client or configure legacy
+    client = _get_openai_client()                  # get client or configure legacy module
     try:
-        if _HAS_NEW_OPENAI:                        # new SDK call shape
-            with open(local_file_path, "rb") as f:
+        if _HAS_NEW_OPENAI:
+            with open(local_file_path, "rb") as f:  # open file in binary mode for upload
                 if prefer_translate:
                     resp = client.audio.translations.create(
                         model=ASR_MODEL,
@@ -164,8 +170,9 @@ def transcribe_audio_file(local_file_path: str, prefer_translate: bool = True) -
                         response_format="text",
                         temperature=0.0,
                     )
-            return resp.strip() if isinstance(resp, str) else str(resp).strip()
-        else:                                      # legacy SDK call shape
+            return resp.strip() if isinstance(resp, str) else str(resp).strip()  # normalize to stripped string
+        else:
+            import openai  # type: ignore
             with open(local_file_path, "rb") as f:
                 if prefer_translate:
                     resp = openai.Audio.translations.create(  # type: ignore
@@ -183,23 +190,25 @@ def transcribe_audio_file(local_file_path: str, prefer_translate: bool = True) -
                     )
             return resp.strip() if isinstance(resp, str) else str(resp).strip()
     except Exception as e:
-        print(f"[ASR] Transcription error for {local_file_path}: {e}")
+        print(f"[ASR] Transcription error for {local_file_path}: {e}")  # log ASR-level errors
         raise
 
 # ====================== Helpers for recording_url processing ======================
 def file_ext_from_url(url: str) -> str:
-    """Return file extension from URL path or default to .mp3 when none present."""
-    parsed = urlparse(url)                         # parse URL to extract path
-    _, ext = os.path.splitext(parsed.path)        # get extension part
-    return ext if ext else ".mp3"                 # fallback to .mp3
+    """Extract file extension from URL path or return default .mp3 when missing."""
+    parsed = urlparse(url)                         # parse URL to access path component
+    _, ext = os.path.splitext(parsed.path)        # split extension from path
+    return ext if ext else ".mp3"               # fallback to .mp3 when extension absent
+
 
 def is_allowed_extension_from_url(url: str) -> bool:
-    """Return True if URL extension is among known audio extensions."""
-    ext = file_ext_from_url(url).lower()          # lowercase extension
+    """Return True if URL extension exists in allowed extensions list."""
+    ext = file_ext_from_url(url).lower()          # normalize to lowercase for comparison
     return ext in ALLOWED_EXTS
 
+
 def content_type_looks_like_audio(content_type: Optional[str]) -> bool:
-    """Return True if Content-Type header appears audio-like or acceptable for ASR."""
+    """Perform substring checks to decide if Content-Type header looks audio-like."""
     if not content_type:
         return False
     ct = content_type.lower()
@@ -210,10 +219,7 @@ def content_type_looks_like_audio(content_type: Optional[str]) -> bool:
 
 # ====================== Upsert into pa_recordings ======================
 def upsert_pa_recording(engine: Engine, recording_url: str, created: datetime, transcript: str, call_type: str, status: str = "pending") -> None:
-    """
-    Insert or update a record in public.pa_recordings keyed by pa_recording_url.
-    created stores the exact same timestamp as source table's created column.
-    """
+    """Insert or update a pa_recordings row keyed by pa_recording_url using ON CONFLICT."""
     upsert_sql = """
     INSERT INTO public.pa_recordings (pa_recording_url, created, pa_en_transcribe, call_type, status)
     VALUES (:url, :created, :transcript, :call_type, :status)
@@ -225,7 +231,7 @@ def upsert_pa_recording(engine: Engine, recording_url: str, created: datetime, t
     """
     run_sql(engine, upsert_sql, {
         "url": recording_url,
-        "created": created,                       # store exact same timestamp as source
+        "created": created,
         "transcript": transcript,
         "call_type": call_type,
         "status": status
@@ -233,168 +239,141 @@ def upsert_pa_recording(engine: Engine, recording_url: str, created: datetime, t
 
 # ====================== High-water-mark helper ======================
 def max_pa_created(engine: Engine) -> Optional[str]:
-    """Return ISO string of maximum created currently stored in pa_recordings (or None)."""
-    rows = fetch_all(engine, "SELECT max(created) AS mx FROM public.pa_recordings")
+    """Return ISO string for maximum created timestamp stored in pa_recordings or None."""
+    rows = fetch_all(engine, "SELECT max(created) AS mx FROM public.pa_recordings")  # query max(created)
     if not rows:
         return None
     mx = rows[0].get("mx")
     if mx is None:
         return None
-    return mx.isoformat()                         # convert datetime to ISO format string
+    return mx.isoformat()                         # convert datetime to ISO string
 
 # ====================== Fetch source rows from outbound_inbound_calling_details ======================
 def fetch_oicd_rows(engine: Engine, since_iso: Optional[str], limit: Optional[int] = None) -> List[dict]:
-    """
-    Fetch rows from outbound_inbound_calling_details with created > :since.
-    If since_iso is None, compute high-water-mark from pa_recordings table or fallback to DEFAULT_SINCE_ISO.
-    """
-    if since_iso is None:                             # if user did not provide --since
-        hw = max_pa_created(engine)                   # get maximum created processed so far from pa_recordings
-        since_param = hw if hw else DEFAULT_SINCE_ISO # use hw if exists else fallback default
+    """Fetch rows from outbound_inbound_calling_details where created > :since ordered ascending by created."""
+    if since_iso is None:
+        hw = max_pa_created(engine)                   # compute high-water-mark from pa_recordings
+        since_param = hw if hw else DEFAULT_SINCE_ISO # fallback to DEFAULT_SINCE_ISO when no high-water-mark
     else:
-        since_param = since_iso                       # use explicit since provided
+        since_param = since_iso
 
     base_sql = "SELECT * FROM public.outbound_inbound_calling_details oicd WHERE oicd.created > :since ORDER BY oicd.created ASC"
     if limit:
-        base_sql += " LIMIT :limit"
+        base_sql += " LIMIT :limit"                  # append LIMIT if provided to control per-iteration rows
         params = {"since": since_param, "limit": limit}
     else:
         params = {"since": since_param}
 
-    return fetch_all(engine, base_sql, params)
+    return fetch_all(engine, base_sql, params)        # return list of dict rows
 
-# ====================== Main ingestion flow (HTTP-only, prefix support) ======================
-def ingest_pa_http(since_iso: Optional[str] = None, limit: Optional[int] = None, prefer_translate: bool = True) -> None:
-    """
-    Core flow:
-    - compute high-water-mark if since_iso is None
-    - fetch candidate rows from outbound_inbound_calling_details
-    - for each row: normalize recording value, rewrite to full URL if needed, validate, download, validate response, transcribe, upsert
-    - always write status='pending' and created = source.created for processed rows (including failures)
+# ====================== Core ingestion flow (HTTP-only, prefix support) ======================
+def ingest_pa_http(since_iso: Optional[str] = None, limit: Optional[int] = None, prefer_translate: bool = True, engine: Optional[Engine] = None) -> dict:
+    """Process new rows: download audio via HTTP, transcribe via OpenAI, upsert into pa_recordings.
+
+    Returns a summary dict with counts for the iteration.
     """
     if requests is None:
-        raise RuntimeError("The 'requests' library is required. Install via `pip install requests`.")
+        raise RuntimeError("The 'requests' library is required. Install via `pip install requests`.")  # require requests module
 
-    engine = get_engine()                             # create and reuse single SQLAlchemy engine
-    init_db(engine)                                   # ensure pa_recordings exists (use same engine)
+    engine_in_use = engine if engine is not None else get_engine()  # allow passing a reusable engine
+    init_db(engine_in_use)                                         # ensure pa_recordings exists before processing
 
     since_param_for_log = since_iso if since_iso is not None else "(auto from pa_recordings.max(created) or default)"
-    print(f" Determining source rows using since: {since_param_for_log}")  # log which since will be used
+    print(f" Determining source rows using since: {since_param_for_log}")
 
-    rows = fetch_oicd_rows(engine, since_iso, limit=limit)  # fetch candidate rows
+    rows = fetch_oicd_rows(engine_in_use, since_iso, limit=limit)  # fetch candidate source rows
     print(f" Found {len(rows)} candidate rows.")
 
-    processed = 0                                     # counters for summary
+    processed = 0
     succeeded = 0
     failed = 0
     skipped = 0
 
-    for row in rows:                                  # iterate rows in ascending order of created
+    for row in rows:
         processed += 1
         try:
-            # tolerant extraction of fields from the source row
-            raw_val = row.get("recording_url") or row.get("recordingUrl") or row.get("recording") or row.get("recordingLink")
-            created = row.get("created")            # source 'created' timestamp (datetime from outbound_inbound_calling_details)
+            raw_val = row.get("recording_url") or row.get("recordingUrl") or row.get("recording") or row.get("recordingLink")  # tolerate multiple column names
+            created = row.get("created")
             call_type = row.get("call_type") or row.get("calltype") or row.get("direction") or row.get("call_type_io") or "unknown"
-            source_id = row.get("id")               # source id for logs
+            source_id = row.get("id")
 
-            # Normalize early: convert to string and strip whitespace BEFORE any emptiness checks
-            raw_val = "" if raw_val is None else str(raw_val).strip()
+            raw_val = "" if raw_val is None else str(raw_val).strip()  # normalize to trimmed string
             print(f"\n[{processed}] Source id={source_id} Original DB value: {raw_val!r}")
 
-            # If normalized value is empty after strip -> skip and record skipped
             if not raw_val:
                 print(f"  Skipping id={source_id} — recording value is empty/whitespace")
                 skipped += 1
                 continue
 
-            # Build full URL if DB stored a path-only value (no scheme) and prefix is provided
-            parsed_initial = urlparse(raw_val)
+            parsed_initial = urlparse(raw_val)                     # parse initial value to check for scheme
             recording_url = raw_val
             if (not parsed_initial.scheme) and PA_RECORDING_HTTP_PREFIX:
-                # safe-quote path portion and join with prefix
-                quoted_path = quote(raw_val.lstrip("/"))
+                quoted_path = quote(raw_val.lstrip("/"))        # safely quote path when joining
                 recording_url = PA_RECORDING_HTTP_PREFIX + "/" + quoted_path
                 print(f"  Rewrote DB path to full URL using PA_RECORDING_HTTP_PREFIX -> {recording_url}")
 
-            parsed = urlparse(recording_url)        # parse final URL
+            parsed = urlparse(recording_url)                       # parse final recording_url
 
-            # If path ends with a slash (directory-like), skip — no filename to download
             if parsed.path.endswith("/"):
                 print(f"  Skipping id={source_id} — URL looks like a directory (no file): {recording_url}")
                 skipped += 1
-                # still upsert pending record to advance high-water-mark (as per requirement)
                 try:
-                    upsert_pa_recording(engine, recording_url, created, transcript="", call_type=call_type, status="pending")
+                    upsert_pa_recording(engine_in_use, recording_url, created, transcript="", call_type=call_type, status="pending")
                     print(f"  Upserted pending record for id={source_id} (directory-like path).")
                 except Exception as e:
                     print(f"  Failed to upsert pending record for id={source_id}: {e}")
                 continue
 
-            # Validate extension guard BEFORE trying to download (helps skip obvious non-audio)
             if not is_allowed_extension_from_url(recording_url):
-                # extension is not among allowed list — still allow server to respond with proper content-type,
-                # but prefer to skip to avoid known-bad files.
                 print(f"  Warning id={source_id}: file extension not in allowed list: {file_ext_from_url(recording_url)}; attempting download but will validate content-type.")
-                # do not increment skipped yet; attempt download and validate response headers below
 
-            # Accept only http/https schemes
             if parsed.scheme not in ("http", "https"):
                 print(f"  Skipping id={source_id} — unsupported URL scheme: {parsed.scheme}")
                 skipped += 1
                 continue
 
-            # Download via HTTP streaming into a temporary file
             local_tmp_path = None
             try:
                 print(f"  Downloading id={source_id}: {recording_url}")
-                resp = requests.get(recording_url, stream=True, timeout=60)  # 60s timeout
-                resp.raise_for_status()                                       # raise for HTTP errors
+                resp = requests.get(recording_url, stream=True, timeout=60)  # stream to avoid large memory usage
+                resp.raise_for_status()                                       # raise for HTTP errors (4xx/5xx)
             except Exception as e:
                 print(f"  HTTP download failed for id={source_id} url={recording_url}: {e}")
                 failed += 1
-                # Upsert pending record so high-water-mark can advance
                 try:
-                    upsert_pa_recording(engine, recording_url, created, transcript="", call_type=call_type, status="pending")
+                    upsert_pa_recording(engine_in_use, recording_url, created, transcript="", call_type=call_type, status="pending")
                     print(f"  Upserted pending row for id={source_id} after download failure.")
                 except Exception as e2:
                     print(f"  Failed to upsert pending row for id={source_id} after download failure: {e2}")
                 continue
 
-            # Validate Content-Type header to ensure it's audio or acceptable binary
             content_type = resp.headers.get("content-type", "")
             content_length = resp.headers.get("content-length")
             if not content_type_looks_like_audio(content_type):
-                # If content-type doesn't look audio, we still may accept application/octet-stream
-                # but prefer to skip and upsert pending to avoid sending invalid files to ASR.
                 print(f"  Downloaded resource Content-Type not audio-like for id={source_id}: {content_type!r}")
-                # Consume body minimally to avoid leaving connection open then upsert pending
                 try:
-                    _ = resp.content  # read content to close connection
+                    _ = resp.content  # read body to close connection
                 except Exception:
                     pass
                 failed += 1
                 try:
-                    upsert_pa_recording(engine, recording_url, created, transcript="", call_type=call_type, status="pending")
+                    upsert_pa_recording(engine_in_use, recording_url, created, transcript="", call_type=call_type, status="pending")
                     print(f"  Upserted pending row for id={source_id} due to non-audio Content-Type.")
                 except Exception as e2:
                     print(f"  Failed to upsert pending row for id={source_id}: {e2}")
                 continue
 
-            # stream response to temp file and ensure size is reasonable
             try:
-                ext = file_ext_from_url(recording_url)                 # extension for temp file naming
+                ext = file_ext_from_url(recording_url)
                 with tempfile.NamedTemporaryFile(delete=False, suffix=ext, prefix="pa_audio_") as tmp:
                     written = 0
                     for chunk in resp.iter_content(chunk_size=8192):
                         if chunk:
                             tmp.write(chunk)
                             written += len(chunk)
-                    local_tmp_path = tmp.name                        # path of temp file
-                # basic file size check to avoid tiny non-audio files
+                    local_tmp_path = tmp.name
                 if written < MIN_AUDIO_BYTES:
                     print(f"  Downloaded file too small for id={source_id} (bytes={written}), skipping ASR.")
-                    # cleanup small file
                     try:
                         if local_tmp_path and os.path.exists(local_tmp_path):
                             os.remove(local_tmp_path)
@@ -402,7 +381,7 @@ def ingest_pa_http(since_iso: Optional[str] = None, limit: Optional[int] = None,
                         pass
                     failed += 1
                     try:
-                        upsert_pa_recording(engine, recording_url, created, transcript="", call_type=call_type, status="pending")
+                        upsert_pa_recording(engine_in_use, recording_url, created, transcript="", call_type=call_type, status="pending")
                         print(f"  Upserted pending row for id={source_id} due to tiny download.")
                     except Exception as e2:
                         print(f"  Failed to upsert pending row for id={source_id}: {e2}")
@@ -410,39 +389,34 @@ def ingest_pa_http(since_iso: Optional[str] = None, limit: Optional[int] = None,
             except Exception as e:
                 print(f"  Failed while saving response to temp file for id={source_id}: {e}")
                 failed += 1
-                # cleanup if any partial file exists
                 try:
                     if local_tmp_path and os.path.exists(local_tmp_path):
                         os.remove(local_tmp_path)
                 except Exception:
                     pass
                 try:
-                    upsert_pa_recording(engine, recording_url, created, transcript="", call_type=call_type, status="pending")
+                    upsert_pa_recording(engine_in_use, recording_url, created, transcript="", call_type=call_type, status="pending")
                     print(f"  Upserted pending row for id={source_id} after temp-file write failure.")
                 except Exception as e2:
                     print(f"  Failed to upsert pending row for id={source_id}: {e2}")
                 continue
 
-            # At this point we have a temporary file likely containing audio; call ASR
             try:
                 print(f"  Transcribing id={source_id} file={local_tmp_path} (prefer_translate={prefer_translate})")
                 transcript = transcribe_audio_file(local_tmp_path, prefer_translate=prefer_translate)
                 print(f"  Transcription length for id={source_id}: {len(transcript)} characters")
-                # Upsert transcript with status='pending' (per requirement) and created set to source.created
-                upsert_pa_recording(engine, recording_url, created, transcript, call_type, status="pending")
+                upsert_pa_recording(engine_in_use, recording_url, created, transcript, call_type, status="pending")
                 succeeded += 1
                 print(f"  Upserted pending transcript for id={source_id} url={recording_url}")
             except Exception as e:
                 print(f"  Transcription/upsert failed for id={source_id} url={recording_url}: {e}")
                 failed += 1
-                # ensure pending record is present so high-water-mark advances
                 try:
-                    upsert_pa_recording(engine, recording_url, created, transcript="", call_type=call_type, status="pending")
+                    upsert_pa_recording(engine_in_use, recording_url, created, transcript="", call_type=call_type, status="pending")
                     print(f"  Upserted pending row for id={source_id} after ASR failure.")
                 except Exception as e2:
                     print(f"  Failed to upsert pending row for id={source_id} after ASR failure: {e2}")
             finally:
-                # cleanup local temp file if created
                 try:
                     if local_tmp_path and os.path.exists(local_tmp_path):
                         os.remove(local_tmp_path)
@@ -450,23 +424,20 @@ def ingest_pa_http(since_iso: Optional[str] = None, limit: Optional[int] = None,
                     print(f"  Temp cleanup warning for id={source_id}: {cleanup_err}")
 
         except Exception as outer:
-            # catch-all to avoid stopping the entire ingestion on single-row errors
             print(f"[{processed}] Unexpected error while processing source id={row.get('id')}: {outer}")
             failed += 1
-            # attempt to write pending row with whatever URL info we have
             try:
                 url_for_upsert = (row.get("recording_url") or "").strip()
                 if not url_for_upsert and PA_RECORDING_HTTP_PREFIX:
-                    url_for_upsert = PA_RECORDING_HTTP_PREFIX  # best-effort fallback
-                upsert_pa_recording(engine, url_for_upsert, row.get("created") or datetime.now(timezone.utc), transcript="", call_type=row.get("call_type") or "unknown", status="pending")
+                    url_for_upsert = PA_RECORDING_HTTP_PREFIX
+                upsert_pa_recording(engine_in_use, url_for_upsert, row.get("created") or datetime.now(timezone.utc), transcript="", call_type=row.get("call_type") or "unknown", status="pending")
                 print(f"  Upserted fallback pending row for id={row.get('id')} after unexpected error.")
             except Exception as e2:
                 print(f"  Failed fallback upsert after unexpected error for id={row.get('id')}: {e2}")
             continue
 
-    # print ingest summary
     print("\n" + "=" * 60)
-    print("PA INGESTION SUMMARY")
+    print("PA INGESTION ITERATION SUMMARY")
     print("=" * 60)
     print(f" Candidates fetched: {len(rows)}")
     print(f" Processed attempts: {processed}")
@@ -475,24 +446,69 @@ def ingest_pa_http(since_iso: Optional[str] = None, limit: Optional[int] = None,
     print(f" Skipped: {skipped}")
     print("=" * 60)
 
+    return {
+        "candidates": len(rows),
+        "processed": processed,
+        "succeeded": succeeded,
+        "failed": failed,
+        "skipped": skipped
+    }
+
+# ====================== Realtime/watch mode ======================
+def watch_loop(interval: int = DEFAULT_POLL_INTERVAL, since_iso: Optional[str] = None, limit: Optional[int] = None, prefer_translate: bool = True):
+    """Continuously poll for new rows every `interval` seconds and process them using ingest_pa_http.
+
+    The `limit` parameter controls how many rows are processed per iteration (useful to cap workload).
+    """
+    engine = get_engine()                          # create a single reusable DB engine
+    init_db(engine)                                # ensure schema exists before entering loop
+
+    iteration = 0
+    print(f" Entering watch loop: polling every {interval} seconds. Press Ctrl+C to stop.")
+
+    global _SHUTDOWN_REQUESTED
+    while not _SHUTDOWN_REQUESTED:
+        iteration += 1
+        print(f"\n--- WATCH ITERATION {iteration} @ {datetime.now(timezone.utc).isoformat()} ---")
+        try:
+            summary = ingest_pa_http(since_iso=since_iso, limit=limit, prefer_translate=prefer_translate, engine=engine)  # process up to `limit` rows
+        except Exception as e:
+            print(f" Watch iteration error: {e}")
+            traceback.print_exc()
+        if _SHUTDOWN_REQUESTED:
+            print(" Shutdown requested; breaking watch loop.")
+            break
+        slept = 0.0
+        while slept < interval and not _SHUTDOWN_REQUESTED:
+            time.sleep(1.0)                           # sleep in 1s increments to respond quickly to signals
+            slept += 1.0
+    print(" Watch loop exited cleanly. Goodbye.")
+
 # ============================= CLI =============================
 def main():
-    """Parse CLI arguments and dispatch commands (init_db, ingest_pa)."""
-    parser = argparse.ArgumentParser(description="PA Call Analyzer (HTTP-only) - ingest & transcribe recordings into pa_recordings")
+    """CLI parsing and command dispatch for init_db, ingest_pa, and watch commands."""
+    parser = argparse.ArgumentParser(description="PA Call Analyzer (HTTP-only) - ingest & transcribe recordings into pa_recordings (supports watch mode with --limit)")
     subs = parser.add_subparsers(dest="command", help="commands")
 
     subs.add_parser("init_db", help="Create/ensure public.pa_recordings table")
 
-    p = subs.add_parser("ingest_pa", help="Fetch rows and transcribe recording_url via HTTP(S)")
+    p = subs.add_parser("ingest_pa", help="Fetch rows and transcribe recording_url via HTTP(S) for a single pass")
     p.add_argument("--since", type=str, default=None, help="ISO timestamp boundary (default: auto high-water-mark from pa_recordings or fallback)")
     p.add_argument("--limit", type=int, default=None, help="Optional LIMIT for number of rows to process")
     p.add_argument("--no-translate", action="store_true", help="Use transcription (not translation) endpoint")
     p.add_argument("--prefer-translate", action="store_true", help="Prefer translation endpoint (overrides --no-translate)")
 
+    w = subs.add_parser("watch", help="Run ingestion in realtime polling mode (continuous loop)")
+    w.add_argument("--interval", type=int, default=DEFAULT_POLL_INTERVAL, help=f"Seconds between polling iterations (default: {DEFAULT_POLL_INTERVAL})")
+    w.add_argument("--since", type=str, default=None, help="Optional fixed ISO timestamp boundary to always use (if not provided, high-water-mark is auto-computed each iteration)")
+    w.add_argument("--limit", type=int, default=None, help="Optional per-iteration LIMIT (e.g., --limit 5) to cap rows processed per poll")
+    w.add_argument("--no-translate", action="store_true", help="Use transcription (not translation) endpoint")
+    w.add_argument("--prefer-translate", action="store_true", help="Prefer translation endpoint (overrides --no-translate)")
+
     args = parser.parse_args()
 
     if args.command == "init_db":
-        init_db()                                  # ensure table exists (standalone)
+        init_db()
         print(" Database init complete.")
         return
 
@@ -502,7 +518,6 @@ def main():
         if requests is None:
             raise SystemExit("CRITICAL: 'requests' library not installed. Install with `pip install requests`.")
 
-        # choose prefer_translate precedence
         if args.prefer_translate:
             prefer_translate = True
         elif args.no_translate:
@@ -510,12 +525,32 @@ def main():
         else:
             prefer_translate = True
 
-        # warn if prefix not set and DB likely contains path-only values
         if not PA_RECORDING_HTTP_PREFIX:
             print(" WARNING: PA_RECORDING_HTTP_PREFIX is not set. If DB stores only path/keys (not full URLs), downloads may fail.")
 
-        # run ingestion; when args.since is None the script auto-computes high-water-mark
         ingest_pa_http(since_iso=args.since, limit=args.limit, prefer_translate=prefer_translate)
+        return
+
+    if args.command == "watch":
+        if requests is None:
+            raise SystemExit("CRITICAL: 'requests' library not installed. Install with `pip install requests`.")
+
+        if args.prefer_translate:
+            prefer_translate = True
+        elif args.no_translate:
+            prefer_translate = False
+        else:
+            prefer_translate = True
+
+        if not PA_RECORDING_HTTP_PREFIX:
+            print(" WARNING: PA_RECORDING_HTTP_PREFIX is not set. If DB stores only path/keys (not full URLs), downloads may fail.")
+
+        try:
+            watch_loop(interval=args.interval, since_iso=args.since, limit=args.limit, prefer_translate=prefer_translate)
+        except Exception as e:
+            print(f" Fatal error in watch loop: {e}")
+            traceback.print_exc()
+            raise SystemExit(1)
         return
 
     parser.print_help()
@@ -530,4 +565,5 @@ if __name__ == "__main__":
         raise SystemExit(1)
     except Exception as e:
         print(f" Fatal error in main: {e}")
+        traceback.print_exc()
         raise SystemExit(1)
